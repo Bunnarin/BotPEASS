@@ -15,9 +15,7 @@ DESCRIPTION_KEYWORDS_I:
 - linpeas
 - winpeas
 - docker
-- kubernetes
 - " lxc "
-- podman
 
 DESCRIPTION_KEYWORDS:
 - ThisIsACaseSensitiveExample
@@ -25,13 +23,13 @@ DESCRIPTION_KEYWORDS:
 PRODUCT_KEYWORDS_I:
 - sudo
 - docker
-- kubernetes
 - lxc
-- podman
 - container
 - linux
 - windows
-- macos
+- nodejs
+- php
+- nocobase
 
 
 PRODUCT_KEYWORDS:
