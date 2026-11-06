@@ -58,7 +58,7 @@ DESCRIPTION_KEYWORDS_I:
 # - linpeas
 # - winpeas
 - docker docker
-- kernel
+# - kernel
 # - " lxc "
 
 DESCRIPTION_KEYWORDS:
@@ -75,7 +75,8 @@ PRODUCT_KEYWORDS_I:
 - docker docker
 - nodejs node.js
 - nocobase
-- canonical ubuntu_linux
+# hidden bcuz I scan directly on prod instead
+# - canonical ubuntu_linux
 
 PRODUCT_KEYWORDS:
 - ThisIsACaseSensitiveExample
