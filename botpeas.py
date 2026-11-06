@@ -5,13 +5,16 @@ import json
 import os
 import yaml
 import vulners
+import time
+import re
 
 from os.path import join
 from enum import Enum
 from discord import Webhook, RequestsWebhookAdapter
+from dotenv import load_dotenv
 
+load_dotenv()
 
-CIRCL_LU_URL = "https://cve.circl.lu/api/query"
 CVES_JSON_PATH = join(pathlib.Path(__file__).parent.absolute(), "output/botpeas.json")
 LAST_NEW_CVE = datetime.datetime.now() - datetime.timedelta(days=1)
 LAST_MODIFIED_CVE = datetime.datetime.now() - datetime.timedelta(days=1)
@@ -23,6 +26,18 @@ DESCRIPTION_KEYWORDS_I = []
 DESCRIPTION_KEYWORDS = []
 PRODUCT_KEYWORDS_I = []
 PRODUCT_KEYWORDS = []
+MIN_CVSS_SCORE = 7.0
+INCLUDE_UNSCORED = False
+IGNORE_REJECTED = True
+NOTIFY_MODIFIED = False
+MATCH_MODE = "OR"
+NVD_API_KEY = ""
+ONLY_ACTIONABLE = True
+ACTIONABLE_MIN_CVSS = 9.0
+ACTIONABLE_VECTORS = ["NETWORK"]
+MODIFIED_ONLY_IF_EXPLOITED = False
+EXCLUDE_DESCRIPTION_KEYWORDS_I = []
+DESCRIPTION_MATCH_CHARS = 300
 
 
 class Time_Type(Enum):
@@ -32,25 +47,46 @@ class Time_Type(Enum):
 
 ################## LOAD CONFIGURATIONS ####################
 
+def is_cvss_valid(cvss_val) -> bool:
+    ''' Check if the CVSS score meets the minimum threshold '''
+    if cvss_val is None or cvss_val == "N/A" or cvss_val == "":
+        return INCLUDE_UNSCORED
+    try:
+        score = float(cvss_val)
+        return score >= MIN_CVSS_SCORE
+    except (ValueError, TypeError):
+        return INCLUDE_UNSCORED
+
+
 def load_keywords():
-    ''' Load keywords from config file '''
+    ''' Load keywords and filtering options from config file '''
 
     global ALL_VALID
     global DESCRIPTION_KEYWORDS_I, DESCRIPTION_KEYWORDS
     global PRODUCT_KEYWORDS_I, PRODUCT_KEYWORDS
-    global NTFY_URL, NTFY_TOPIC, NTFY_AUTH
+    global MIN_CVSS_SCORE, INCLUDE_UNSCORED, IGNORE_REJECTED, NOTIFY_MODIFIED, MATCH_MODE, NVD_API_KEY
 
     with open(KEYWORDS_CONFIG_PATH, 'r') as yaml_file:
-        keywords_config = yaml.safe_load(yaml_file)
-        print(f"Loaded keywords: {keywords_config}")
-        ALL_VALID = keywords_config["ALL_VALID"]
-        DESCRIPTION_KEYWORDS_I = keywords_config["DESCRIPTION_KEYWORDS_I"]
-        DESCRIPTION_KEYWORDS = keywords_config["DESCRIPTION_KEYWORDS"]
-        PRODUCT_KEYWORDS_I = keywords_config["PRODUCT_KEYWORDS_I"]
-        PRODUCT_KEYWORDS = keywords_config["PRODUCT_KEYWORDS"]
-        #NTFY_URL = keywords_config.get("NTFY_URL", "")
-        #NTFY_TOPIC = keywords_config.get("NTFY_TOPIC", "")
-        #NTFY_AUTH = keywords_config.get("NTFY_AUTH", "")
+        keywords_config = yaml.safe_load(yaml_file) or {}
+        print(f"Loaded config: {keywords_config}")
+        NVD_API_KEY = str(keywords_config.get("NVD_API_KEY", "") or "").strip()
+        key_detected = bool(os.getenv("NVD_API_KEY") or NVD_API_KEY)
+        ALL_VALID = keywords_config.get("ALL_VALID", False)
+        DESCRIPTION_KEYWORDS_I = keywords_config.get("DESCRIPTION_KEYWORDS_I") or []
+        DESCRIPTION_KEYWORDS = keywords_config.get("DESCRIPTION_KEYWORDS") or []
+        PRODUCT_KEYWORDS_I = keywords_config.get("PRODUCT_KEYWORDS_I") or []
+        PRODUCT_KEYWORDS = keywords_config.get("PRODUCT_KEYWORDS") or []
+        MIN_CVSS_SCORE = float(keywords_config.get("MIN_CVSS_SCORE", 0.0))
+        INCLUDE_UNSCORED = bool(keywords_config.get("INCLUDE_UNSCORED", False))
+        IGNORE_REJECTED = bool(keywords_config.get("IGNORE_REJECTED", True))
+        NOTIFY_MODIFIED = bool(keywords_config.get("NOTIFY_MODIFIED", False))
+        MATCH_MODE = str(keywords_config.get("MATCH_MODE", "OR")).upper()
+        ONLY_ACTIONABLE = bool(keywords_config.get("ONLY_ACTIONABLE", True))
+        ACTIONABLE_MIN_CVSS = float(keywords_config.get("ACTIONABLE_MIN_CVSS", 9.0))
+        ACTIONABLE_VECTORS = [v.upper() for v in (keywords_config.get("ACTIONABLE_VECTORS") or [])]
+        MODIFIED_ONLY_IF_EXPLOITED = bool(keywords_config.get("MODIFIED_ONLY_IF_EXPLOITED", True))
+        EXCLUDE_DESCRIPTION_KEYWORDS_I = keywords_config.get("EXCLUDE_DESCRIPTION_KEYWORDS_I") or []
+        DESCRIPTION_MATCH_CHARS = int(keywords_config.get("DESCRIPTION_MATCH_CHARS", 300))
 
 
 def load_lasttimes():
@@ -84,95 +120,244 @@ def update_lasttimes():
 
 
 ################## SEARCH CVES ####################
+NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
-def get_cves(tt_filter:Time_Type) -> dict:
-    ''' Given the headers for the API retrive CVEs from cve.circl.lu '''
-    now = datetime.datetime.now() - datetime.timedelta(days=1)
-    now_str = now.strftime("%d-%m-%Y")
 
-    headers = {
-        "time_modifier": "from",
-        "time_start": now_str,
-        "time_type": tt_filter.value,
-        "limit": "100",
+def parse_cve_time(time_str: str) -> datetime.datetime:
+    ''' Parse various time formats returned by CVE APIs into naive UTC datetime '''
+    if not time_str:
+        return datetime.datetime.min
+    try:
+        dt = datetime.datetime.fromisoformat(time_str)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        for fmt in (TIME_FORMAT, "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.datetime.strptime(time_str, fmt)
+            except ValueError:
+                pass
+        return datetime.datetime.min
+
+def short_cpe(c: str) -> str:
+    ''' cpe:2.3:o:linux:linux_kernel:6.1:*:... -> "linux linux_kernel" '''
+    parts = c.split(":")
+    return f"{parts[3]} {parts[4]}" if c.startswith("cpe:2.3:") and len(parts) > 4 else c
+
+def normalize_nvd_cve(item: dict) -> dict:
+    ''' Normalize NVD 2.0 CVE format to the dict structure expected by BotPEASS '''
+    cve = item.get("cve", {})
+    cve_id = cve.get("id", "")
+
+    # Description / Summary
+    descriptions = cve.get("descriptions", [])
+    summary = next((d.get("value", "") for d in descriptions if d.get("lang") == "en"), "")
+    if not summary and descriptions:
+        summary = descriptions[0].get("value", "")
+
+    # CVSS Score
+    metrics = cve.get("metrics", {})
+    cvss, vector = "N/A", ""
+    for metric_key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV40", "cvssMetricV2"):
+        metric_list = metrics.get(metric_key, [])
+        if metric_list and isinstance(metric_list, list):
+            cvss_data = metric_list[0].get("cvssData", {})
+            base_score = cvss_data.get("baseScore")
+            if base_score is not None:
+                cvss = base_score
+                vector = str(cvss_data.get("attackVector") or cvss_data.get("accessVector") or "").upper()
+                break
+
+    # Published & Last Modified dates
+    published = cve.get("published", "")
+    last_modified = cve.get("lastModified", published)
+
+    # Vulnerable configuration / products
+    vulnerable_config = []
+    for cfg in cve.get("configurations", []):
+        for node in cfg.get("nodes", []):
+            for cpe in node.get("cpeMatch", []):
+                crit = cpe.get("criteria")
+                if crit:
+                    vulnerable_config.append(short_cpe(crit))
+
+    for aff in cve.get("affected", []):
+        for aff_data in aff.get("affectedData", []):
+            vendor = aff_data.get("vendor", "")
+            product = aff_data.get("product", "")
+            name = f"{vendor} {product}".strip()
+            if name:
+                vulnerable_config.append(name)
+
+    # References
+    references = [ref.get("url", "") for ref in cve.get("references", []) if ref.get("url")]
+
+    return {
+        "id": cve_id,
+        "summary": summary,
+        "cvss": cvss,
+        "vector": vector,
+        "kev": bool(cve.get("cisaExploitAdd")),
+        "Published": published,
+        "last-modified": last_modified,
+        "vulnerable_configuration": list(dict.fromkeys(vulnerable_config)),  # dedupe
+        "references": references,
     }
-    r = requests.get(CIRCL_LU_URL, headers=headers)
 
-    return r.json()
+NVD_MAX_RANGE_DAYS = 119  # NVD rejects date ranges longer than 120 days
+
+def utc_now_naive() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+def get_cves(tt_filter: Time_Type, since: datetime.datetime) -> list:
+    ''' Retrieve and normalize CVEs from NVD API 2.0 since a given naive-UTC time '''
+    end = utc_now_naive()
+    start = since
+    if end - start > datetime.timedelta(days=NVD_MAX_RANGE_DAYS):
+        start = end - datetime.timedelta(days=NVD_MAX_RANGE_DAYS)
+
+    headers = {"User-Agent": "BotPEASS-CVE-Monitor"}
+    nvd_api_key = os.getenv("NVD_API_KEY") or NVD_API_KEY
+    if nvd_api_key:
+        headers["apiKey"] = nvd_api_key.strip()
+
+    fmt = "%Y-%m-%dT%H:%M:%S.000"
+    if tt_filter == Time_Type.PUBLISHED:
+        params = {"pubStartDate": start.strftime(fmt), "pubEndDate": end.strftime(fmt)}
+    else:
+        params = {"lastModStartDate": start.strftime(fmt), "lastModEndDate": end.strftime(fmt)}
+
+    page_size = 2000
+    start_index = 0
+    results = []
+
+    try:
+        while True:
+            params["resultsPerPage"] = page_size
+            params["startIndex"] = start_index
+            r = requests.get(NVD_URL, headers=headers, params=params, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            results.extend(normalize_nvd_cve(i) for i in data.get("vulnerabilities", []))
+
+            start_index += data.get("resultsPerPage", page_size)
+            if start_index >= data.get("totalResults", 0):
+                break
+            time.sleep(0.7 if nvd_api_key else 6)  # respect rate limits
+    except Exception as e:
+        print(f"Error fetching CVEs from NVD: {e}")
+
+    return results
 
 
 def get_new_cves() -> list:
-    ''' Get CVEs that are new '''
-
     global LAST_NEW_CVE
-
-    cves = get_cves(Time_Type.PUBLISHED)
-    filtered_cves, new_last_time = filter_cves(
-            cves["results"],
-            LAST_NEW_CVE,
-            Time_Type.PUBLISHED
-        )
+    cves = get_cves(Time_Type.PUBLISHED, LAST_NEW_CVE)
+    filtered_cves, new_last_time = filter_cves(cves, LAST_NEW_CVE, Time_Type.PUBLISHED)
     LAST_NEW_CVE = new_last_time
-
     return filtered_cves
 
 
 def get_modified_cves() -> list:
-    ''' Get CVEs that has been modified '''
-
     global LAST_MODIFIED_CVE
-
-    cves = get_cves(Time_Type.LAST_MODIFIED)
-    filtered_cves, new_last_time = filter_cves(
-            cves["results"],
-            LAST_MODIFIED_CVE,
-            Time_Type.PUBLISHED
-        )
+    cves = get_cves(Time_Type.LAST_MODIFIED, LAST_MODIFIED_CVE)
+    filtered_cves, new_last_time = filter_cves(cves, LAST_MODIFIED_CVE, Time_Type.LAST_MODIFIED)
     LAST_MODIFIED_CVE = new_last_time
-
     return filtered_cves
 
+def is_excluded(summary: str) -> bool:
+    return any(w.lower() in summary.lower() for w in EXCLUDE_DESCRIPTION_KEYWORDS_I)
+
+
+def is_actionable(cve: dict) -> bool:
+    ''' Exploited in the wild, or critical and reachable the way you care about '''
+    if cve.get("kev"):
+        return True
+    try:
+        score = float(cve.get("cvss"))
+    except (TypeError, ValueError):
+        return False
+    vector_ok = not ACTIONABLE_VECTORS or cve.get("vector") in ACTIONABLE_VECTORS
+    return score >= ACTIONABLE_MIN_CVSS and vector_ok
 
 def filter_cves(cves: list, last_time: datetime.datetime, tt_filter: Time_Type) -> list:
-    ''' Filter by time the given list of CVEs '''
+    ''' Filter by time, score, and keywords the given list of CVEs '''
 
     filtered_cves = []
     new_last_time = last_time
 
     for cve in cves:
-        cve_time = datetime.datetime.strptime(cve[tt_filter.value], TIME_FORMAT)
-        if cve_time > last_time:
-            if ALL_VALID or is_summ_keyword_present(cve["summary"]) or \
-                is_prod_keyword_present(str(cve["vulnerable_configuration"])):
-                
-                filtered_cves.append(cve)
-
+        cve_time = parse_cve_time(cve[tt_filter.value])
         if cve_time > new_last_time:
             new_last_time = cve_time
 
+        if cve_time > last_time:
+            summary = cve.get("summary", "")
+
+            if IGNORE_REJECTED and ("** REJECT **" in summary or "** DISPUTED **" in summary):
+                continue
+            if not is_cvss_valid(cve.get("cvss")):
+                continue
+            if is_excluded(summary):
+                continue
+            if ONLY_ACTIONABLE and not is_actionable(cve):
+                continue
+
+            # Check keywords
+            if ALL_VALID:
+                cve["matched"] = ["ALL_VALID"]
+                filtered_cves.append(cve)
+                continue
+
+            summ_hits, prod_hits = find_matches(cve)
+            has_summ, has_prod = bool(summ_hits), bool(prod_hits)
+
+            if MATCH_MODE == "AND":
+                both_defined = bool(DESCRIPTION_KEYWORDS or DESCRIPTION_KEYWORDS_I) and bool(PRODUCT_KEYWORDS or PRODUCT_KEYWORDS_I)
+                keep = (has_summ and has_prod) if both_defined else (has_summ or has_prod)
+            else:
+                keep = has_summ or has_prod
+
+            if keep:
+                cve["matched"] = summ_hits + prod_hits
+                filtered_cves.append(cve)
+
     return filtered_cves, new_last_time
 
+def kw_in(text: str, kw: str, case_sensitive: bool = False) -> bool:
+    ''' Whole-word match; '_' counts as a separator so "docker" hits "docker_desktop" '''
+    kw = kw.strip()
+    if not kw:
+        return False
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return re.search(rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])", text, flags) is not None
 
-def is_summ_keyword_present(summary: str):
-    ''' Given the summary check if any keyword is present '''
 
-    return any(w in summary for w in DESCRIPTION_KEYWORDS) or \
-            any(w.lower() in summary.lower() for w in DESCRIPTION_KEYWORDS_I)
+def find_matches(cve: dict):
+    ''' Return (summary_hits, product_hits) and remember which products matched '''
+    summary = cve.get("summary", "")
+    scope = summary[:DESCRIPTION_MATCH_CHARS] if DESCRIPTION_MATCH_CHARS else summary
 
+    summ_hits = [f"summary: {w}" for w in DESCRIPTION_KEYWORDS if kw_in(scope, w, True)]
+    summ_hits += [f"summary: {w}" for w in DESCRIPTION_KEYWORDS_I if kw_in(scope, w)]
 
-def is_prod_keyword_present(products: str):
-    ''' Given the summary check if any keyword is present '''
-    
-    return any(w in products for w in PRODUCT_KEYWORDS) or \
-            any(w.lower() in products.lower() for w in PRODUCT_KEYWORDS_I)
+    prod_hits, matched_products = [], []
+    for p in cve.get("vulnerable_configuration", []):
+        for w in PRODUCT_KEYWORDS:
+            if kw_in(p, w, True):
+                prod_hits.append(f"product: {w} ({p})")
+                matched_products.append(p)
+        for w in PRODUCT_KEYWORDS_I:
+            if kw_in(p, w):
+                prod_hits.append(f"product: {w} ({p})")
+                matched_products.append(p)
 
+    cve["matched_products"] = list(dict.fromkeys(matched_products))
+    return list(dict.fromkeys(summ_hits)), list(dict.fromkeys(prod_hits))
 
 def search_exploits(cve: str) -> list:
     ''' Given a CVE it will search for public exploits to abuse it '''
-    
-    return []
-    #TODO: Find a better way to discover exploits
-
     vulners_api_key = os.getenv('VULNERS_API_KEY')
     
     if vulners_api_key:
@@ -180,41 +365,50 @@ def search_exploits(cve: str) -> list:
         cve_data = vulners_api.searchExploit(cve)
         return [v['vhref'] for v in cve_data]
     
-    else:
-        print("VULNERS_API_KEY wasn't configured in the secrets!")
-    
     return []
+    
+def short_summary(summary: str, limit: int = 300) -> str:
+    ''' Trim at a sentence (or word) boundary instead of mid-word '''
+    marker = "has been resolved:"
+    if marker in summary:
+        lines = [l.strip() for l in summary.split(marker, 1)[1].splitlines() if l.strip()]
+        summary = "Linux kernel: " + lines[0] if lines else summary
+    summary = " ".join(summary.split())
+    if len(summary) <= limit:
+        return summary
+    cut = summary[:limit]
+    end = cut.rfind(". ")
+    if end > limit * 0.5:
+        return cut[:end + 1]
+    return cut.rsplit(" ", 1)[0] + "…"
 
 
-#################### GENERATE MESSAGES #########################
+def product_line(cve: dict, n: int = 3) -> str:
+    ''' Matched products first, then the rest, e.g. "canonical ubuntu_linux, isc bind +12 more" '''
+    allp = cve.get("vulnerable_configuration", [])
+    ordered = list(dict.fromkeys(cve.get("matched_products", []) + allp))
+    if not ordered:
+        return "unknown product"
+    shown = ", ".join(md_safe(p) for p in ordered[:n])
+    extra = len(ordered) - n
+    return shown + (f" +{extra} more" if extra > 0 else "")
+
+
+def _build_message(icon: str, cve: dict) -> str:
+    flag = "  🔥 *Exploited*" if cve.get("kev") else ""
+    message = f"{icon} *{md_safe(cve['id'])}* — {product_line(cve)}\n"
+    message += f"CVSS {cve['cvss']}{flag}\n"
+    message += md_safe(short_summary(cve.get("summary", ""))) + "\n"
+    matched = cve.get("matched", [])
+    if matched:
+        message += "🎯 " + md_safe("; ".join(matched[:3]))
+    return message + "\n"
 
 def generate_new_cve_message(cve_data: dict) -> str:
-    ''' Generate new CVE message for sending to slack '''
-
-    message = f"🚨  *{cve_data['id']}*  🚨\n"
-    message += f"🔮  *CVSS*: {cve_data['cvss']}\n"
-    message += f"📅  *Published*: {cve_data['Published']}\n"
-    message += "📓  *Summary*: " 
-    message += cve_data["summary"] if len(cve_data["summary"]) < 500 else cve_data["summary"][:500] + "..."
-    
-    if cve_data["vulnerable_configuration"]:
-        message += f"\n🔓  *Vulnerable* (_limit to 10_): " + ", ".join(cve_data["vulnerable_configuration"][:10])
-    
-    message += "\n\n🟢 ℹ️  *More information* (_limit to 5_)\n" + "\n".join(cve_data["references"][:5])
-    
-    message += "\n"
-
-    #message += "\n\n(Check the bots description for more information about the bot)\n"
-    
-    return message
-
+    return _build_message("🚨", cve_data)
 
 def generate_modified_cve_message(cve_data: dict) -> str:
-    ''' Generate modified CVE message for sending to slack '''
-
-    message = f"📣 *{cve_data['id']}*(_{cve_data['cvss']}_) was modified the {cve_data['last-modified'].split('T')[0]} (_originally published the {cve_data['Published'].split('T')[0]}_)\n"
-    return message
-
+    return _build_message("🔄", cve_data)
 
 def generate_public_expls_message(public_expls: list) -> str:
     ''' Given the list of public exploits, generate the message '''
@@ -235,7 +429,6 @@ def send_slack_mesage(message: str, public_expls_msg: str):
     slack_url = os.getenv('SLACK_WEBHOOK')
 
     if not slack_url:
-        print("SLACK_WEBHOOK wasn't configured in the secrets!")
         return
     
     json_params = {
@@ -264,34 +457,39 @@ def send_slack_mesage(message: str, public_expls_msg: str):
 
     requests.post(slack_url, json=json_params)
 
+def escape_md_v2(text: str) -> str:
+    ''' Escape all MarkdownV2 special chars except '*' (used for our bold markers) '''
+    return re.sub(r'([_\[\]()~`>#+\-=|{}.!\\])', r'\\\1', text)
+
+def md_safe(text: str) -> str:
+    ''' Remove '*' from dynamic content so it can't unbalance bold markers '''
+    return str(text).replace("*", "")
 
 def send_telegram_message(message: str, public_expls_msg: str):
     ''' Send a message to the telegram group '''
 
     telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
-    telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')    
+    telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
 
     if not telegram_bot_token:
         print("TELEGRAM_BOT_TOKEN wasn't configured in the secrets!")
         return
-    
+
     if not telegram_chat_id:
         print("TELEGRAM_CHAT_ID wasn't configured in the secrets!")
         return
-    
+
     if public_expls_msg:
         message = message + "\n" + public_expls_msg
 
-    message = message.replace(".", "\\.").replace("-", "\\-").replace("(", "\\(").replace(")", "\\)").replace("_", "").replace("[","\\[").replace("]","\\]").replace("{","\\{").replace("}","\\}").replace("=","\\=")
-    r = requests.get(f'https://api.telegram.org/bot{telegram_bot_token}/sendMessage?parse_mode=MarkdownV2&text={message}&chat_id={telegram_chat_id}')
+    api_url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
 
-    resp = r.json()
-    if not resp['ok']:
-        r = requests.get(f'https://api.telegram.org/bot{telegram_bot_token}/sendMessage?parse_mode=MarkdownV2&text=Error with' + message.split("\n")[0] + f'{resp["description"]}&chat_id={telegram_chat_id}')
-        resp = r.json()
-        if not resp['ok']:
-            print("ERROR SENDING TO TELEGRAM: "+ message.split("\n")[0] + resp["description"])
-
+    # Attempt 1: MarkdownV2
+    r = requests.post(api_url, data={
+        "chat_id": telegram_chat_id,
+        "text": escape_md_v2(message),
+        "parse_mode": "MarkdownV2",
+    }, timeout=30)
             
 def send_discord_message(message: str, public_expls_msg: str):
     ''' Send a message to the discord channel webhook '''
@@ -299,7 +497,6 @@ def send_discord_message(message: str, public_expls_msg: str):
     discord_webhok_url = os.getenv('DISCORD_WEBHOOK_URL')
 
     if not discord_webhok_url:
-        print("DISCORD_WEBHOOK_URL wasn't configured in the secrets!")
         return
     
     if public_expls_msg:
@@ -320,13 +517,10 @@ def send_pushover_message(message: str, public_expls_msg: str):
     pushover_token = os.getenv('PUSHOVER_TOKEN') 
 
     if not pushover_device_name:
-        print("PUSHOVER_DEVICE_NAME wasn't configured in the secrets!")
         return 
     if not pushover_user_key:
-        print("PUSHOVER_USER_KEY wasn't configured in the secrets!")
         return
     if not pushover_token:
-        print("PUSHOVER_TOKEN wasn't configured in the secrets!")
         return
     if public_expls_msg:
         message = message + "\n" + public_expls_msg
@@ -346,11 +540,9 @@ def send_ntfy_message(message: str, public_expls_msg: str):
     ntfy_auth = os.getenv('NTFY_AUTH')
 
     if not ntfy_url:
-        print("NTFY_URL wasn't configured in the environment variables!")
         return
 
     if not ntfy_topic:
-        print("NTFY_TOPIC wasn't configured in the environment variables!")
         return
 
     # Combine message and public exploits message if exists
@@ -401,23 +593,40 @@ def main():
         send_ntfy_message(cve_message, public_expls_msg)
 
     #Find and publish modified CVEs
-    modified_cves = get_modified_cves()
+    global LAST_MODIFIED_CVE
+    if NOTIFY_MODIFIED:
+        # Sleep to respect NVD API rate limits (5 requests / 30 seconds without API key)
+        time.sleep(6)
+        modified_cves = get_modified_cves()
 
-    modified_cves = [mcve for mcve in modified_cves if not mcve['id'] in new_cves_ids]
-    modified_cves_ids = [mcve['id'] for mcve in modified_cves]
-    print(f"Modified CVEs discovered: {modified_cves_ids}")
+        modified_cves = [mcve for mcve in modified_cves if not mcve['id'] in new_cves_ids]
+        modified_cves_ids = [mcve['id'] for mcve in modified_cves]
+        if MODIFIED_ONLY_IF_EXPLOITED:
+            modified_cves = [m for m in modified_cves if m.get("kev")]
 
-    for modified_cve in modified_cves:
-        public_exploits = search_exploits(modified_cve['id'])
-        cve_message = generate_modified_cve_message(modified_cve)
-        public_expls_msg = generate_public_expls_message(public_exploits)
-        send_slack_mesage(cve_message, public_expls_msg)
-        send_telegram_message(cve_message, public_expls_msg)
-        send_pushover_message(cve_message, public_expls_msg)
-        send_ntfy_message(cve_message, public_expls_msg)
+        print(f"Modified CVEs discovered: {modified_cves_ids}")
+
+        for modified_cve in modified_cves:
+            public_exploits = search_exploits(modified_cve['id'])
+            cve_message = generate_modified_cve_message(modified_cve)
+            public_expls_msg = generate_public_expls_message(public_exploits)
+            send_slack_mesage(cve_message, public_expls_msg)
+            send_telegram_message(cve_message, public_expls_msg)
+            send_discord_message(cve_message, public_expls_msg)
+            send_pushover_message(cve_message, public_expls_msg)
+            send_ntfy_message(cve_message, public_expls_msg)
+    else:
+        print("Skipping modified CVEs notifications (NOTIFY_MODIFIED is disabled)")
+        LAST_MODIFIED_CVE = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
     #Update last times
     update_lasttimes()
+
+    # call healthcheck
+    try:
+        requests.get('https://hc-ping.com/cqasv55yxlwxoretrhbg8w/cve-notification', timeout=10)
+    except Exception as e:
+        print(f"Healthcheck ping failed: {e}")
 
 
 if __name__ == "__main__":

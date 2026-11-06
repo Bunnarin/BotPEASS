@@ -1,36 +1,81 @@
+# Only alert on CVEs that need action: listed in CISA KEV (exploited in the wild),
+# OR (CVSS >= ACTIONABLE_MIN_CVSS AND attack vector in ACTIONABLE_VECTORS)
+ONLY_ACTIONABLE: yes
+ACTIONABLE_MIN_CVSS: 9.0
+ACTIONABLE_VECTORS:        # empty list = any vector
+- NETWORK
+
+# For "modified" alerts, only notify if the CVE is actively exploited (KEV)
+MODIFIED_ONLY_IF_EXPLOITED: no
+
+# Drop CVEs whose description contains any of these (noise like device-driver bugs)
+EXCLUDE_DESCRIPTION_KEYWORDS_I:
+- virtio
+- ALSA
+- malicious device
+
+# Only look for description keywords in the first N characters of the summary
+# (0 = whole summary). Cuts false positives from incidental mentions.
+DESCRIPTION_MATCH_CHARS: 300
+
+# NVD API Key (optional - can also be set as NVD_API_KEY in .env or GitHub Secrets)
+# Increases rate limit from 5 requests/30s to 50 requests/30s
+# Get a free key at: https://nvd.nist.gov/developers/request-an-api-key
+NVD_API_KEY: ""
+
 ALL_VALID: no
 
+# Minimum CVSS score threshold (0.0 to 10.0)
+# e.g. 7.0 for High/Critical, 9.0 for Critical only, 0.0 to disable
+MIN_CVSS_SCORE: 7.0
+
+# Whether to include new CVEs whose CVSS score has not yet been calculated by NVD
+INCLUDE_UNSCORED: no
+
+# Whether to ignore CVEs that have been rejected or disputed
+IGNORE_REJECTED: yes
+
+# Whether to send alerts for modified CVEs (setting 'no' dramatically cuts down spam)
+NOTIFY_MODIFIED: yes
+
+# Keyword matching mode:
+# 'OR'  = matches if ANY description keyword OR product keyword matches
+# 'AND' = requires AT LEAST ONE product keyword AND AT LEAST ONE description keyword
+MATCH_MODE: "OR"
+
 DESCRIPTION_KEYWORDS_I:
-- privilege escalation
-- escalation
-- privesc
-- high integrity
-- elevated privilege
-- escalation of privilege
-- " sudo "
-- " suid "
-- " pe "
-- " UAC "
-- User Account Control
-- linpeas
-- winpeas
-- docker
-- " lxc "
+# - privilege escalation
+# - escalation
+# - privesc
+# - high integrity
+# - elevated privilege
+# - escalation of privilege
+# - " sudo "
+# - " suid "
+# - " pe "
+# - " UAC "
+# - User Account Control
+# - linpeas
+# - winpeas
+- docker docker
+- kernel
+# - " lxc "
 
 DESCRIPTION_KEYWORDS:
 - ThisIsACaseSensitiveExample
 
 PRODUCT_KEYWORDS_I:
-- sudo
 - docker
-- lxc
-- container
-- linux
-- windows
-- nodejs
-- php
+# - container  # Matches any 'XYZ Container Platform' (e.g. Red Hat OpenShift)
+# Tip: Generic keywords like "linux", "windows", "php" match hundreds of CVEs daily.
+# Consider commenting them out or replacing them with specific software/vendors you use.
+# - linux
+# - windows
+# - php
+- docker docker
+- nodejs node.js
 - nocobase
-
+- canonical ubuntu_linux
 
 PRODUCT_KEYWORDS:
 - ThisIsACaseSensitiveExample

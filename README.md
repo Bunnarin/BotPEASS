@@ -1,7 +1,4 @@
 # BotPEASS
-
-![](https://github.com/carlospolop/BotPEASS/raw/main/images/botpeas.png)
-
 Use this bot to monitor new CVEs containing defined keywords and send alerts to Slack and/or Telegram.
 
 ## See it in action

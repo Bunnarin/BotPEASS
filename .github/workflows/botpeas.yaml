@@ -24,6 +24,7 @@ jobs:
         run: python3 botpeas.py
         shell: bash
         env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           VULNERS_API_KEY: ${{ secrets.VULNERS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
